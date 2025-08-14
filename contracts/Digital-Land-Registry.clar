@@ -8,10 +8,14 @@
 (define-constant ERR_PROPERTY_NOT_FOR_SALE (err u106))
 (define-constant ERR_CANNOT_BUY_OWN_PROPERTY (err u107))
 (define-constant ERR_TRANSFER_FAILED (err u108))
+(define-constant ERR_APPRAISER_NOT_AUTHORIZED (err u109))
+(define-constant ERR_INVALID_APPRAISAL_VALUE (err u110))
+(define-constant ERR_APPRAISER_ALREADY_EXISTS (err u111))
 
 (define-data-var property-id-counter uint u1)
 (define-data-var registry-fee uint u1000000)
 (define-data-var transfer-fee-percent uint u2)
+(define-data-var appraisal-id-counter uint u1)
 
 (define-map properties
     { property-id: uint }
@@ -67,6 +71,30 @@
         status: (string-ascii 20),
         verifier: (optional principal),
         verification-date: (optional uint),
+    }
+)
+
+(define-map authorized-appraisers
+    { appraiser: principal }
+    {
+        authorized-by: principal,
+        authorization-date: uint,
+        is-active: bool,
+        license-number: (string-ascii 50),
+    }
+)
+
+(define-map property-appraisals
+    {
+        property-id: uint,
+        appraisal-id: uint,
+    }
+    {
+        appraiser: principal,
+        appraisal-value: uint,
+        appraisal-date: uint,
+        confidence-level: uint,
+        notes: (string-ascii 200),
     }
 )
 
@@ -382,6 +410,24 @@
     (- (var-get property-id-counter) u1)
 )
 
+(define-read-only (get-appraiser-info (appraiser principal))
+    (map-get? authorized-appraisers { appraiser: appraiser })
+)
+
+(define-read-only (get-property-appraisal
+        (property-id uint)
+        (appraisal-id uint)
+    )
+    (map-get? property-appraisals {
+        property-id: property-id,
+        appraisal-id: appraisal-id,
+    })
+)
+
+(define-read-only (get-appraisal-count)
+    (- (var-get appraisal-id-counter) u1)
+)
+
 (define-public (set-registry-fee (new-fee uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
@@ -396,5 +442,74 @@
         (asserts! (<= new-percent u10) ERR_INVALID_PRICE)
         (var-set transfer-fee-percent new-percent)
         (ok true)
+    )
+)
+
+(define-public (authorize-appraiser
+        (appraiser principal)
+        (license-number (string-ascii 50))
+    )
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts!
+            (is-none (map-get? authorized-appraisers { appraiser: appraiser }))
+            ERR_APPRAISER_ALREADY_EXISTS
+        )
+
+        (map-set authorized-appraisers { appraiser: appraiser } {
+            authorized-by: tx-sender,
+            authorization-date: stacks-block-height,
+            is-active: true,
+            license-number: license-number,
+        })
+        (ok true)
+    )
+)
+
+(define-public (deactivate-appraiser (appraiser principal))
+    (let ((appraiser-info (unwrap! (map-get? authorized-appraisers { appraiser: appraiser })
+            ERR_APPRAISER_NOT_AUTHORIZED
+        )))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+
+        (map-set authorized-appraisers { appraiser: appraiser }
+            (merge appraiser-info { is-active: false })
+        )
+        (ok true)
+    )
+)
+
+(define-public (submit-appraisal
+        (property-id uint)
+        (appraisal-value uint)
+        (confidence-level uint)
+        (notes (string-ascii 200))
+    )
+    (let (
+            (appraiser-info (unwrap! (map-get? authorized-appraisers { appraiser: tx-sender })
+                ERR_APPRAISER_NOT_AUTHORIZED
+            ))
+            (property (unwrap! (map-get? properties { property-id: property-id })
+                ERR_PROPERTY_NOT_FOUND
+            ))
+            (appraisal-id (var-get appraisal-id-counter))
+        )
+        (asserts! (get is-active appraiser-info) ERR_APPRAISER_NOT_AUTHORIZED)
+        (asserts! (> appraisal-value u0) ERR_INVALID_APPRAISAL_VALUE)
+        (asserts! (<= confidence-level u100) ERR_INVALID_APPRAISAL_VALUE)
+
+        (map-set property-appraisals {
+            property-id: property-id,
+            appraisal-id: appraisal-id,
+        } {
+            appraiser: tx-sender,
+            appraisal-value: appraisal-value,
+            appraisal-date: stacks-block-height,
+            confidence-level: confidence-level,
+            notes: notes,
+        })
+
+        (var-set appraisal-id-counter (+ appraisal-id u1))
+        (ok appraisal-id)
     )
 )
