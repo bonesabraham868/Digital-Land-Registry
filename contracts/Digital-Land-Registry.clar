@@ -11,11 +11,18 @@
 (define-constant ERR_APPRAISER_NOT_AUTHORIZED (err u109))
 (define-constant ERR_INVALID_APPRAISAL_VALUE (err u110))
 (define-constant ERR_APPRAISER_ALREADY_EXISTS (err u111))
+(define-constant ERR_PROPERTY_NOT_FOR_RENT (err u112))
+(define-constant ERR_RENTAL_ALREADY_EXISTS (err u113))
+(define-constant ERR_INVALID_RENTAL_PERIOD (err u114))
+(define-constant ERR_RENT_NOT_DUE (err u115))
+(define-constant ERR_NOT_TENANT (err u116))
+(define-constant ERR_RENTAL_EXPIRED (err u117))
 
 (define-data-var property-id-counter uint u1)
 (define-data-var registry-fee uint u1000000)
 (define-data-var transfer-fee-percent uint u2)
 (define-data-var appraisal-id-counter uint u1)
+(define-data-var rental-id-counter uint u1)
 
 (define-map properties
     { property-id: uint }
@@ -95,6 +102,35 @@
         appraisal-date: uint,
         confidence-level: uint,
         notes: (string-ascii 200),
+    }
+)
+
+(define-map rental-listings
+    { property-id: uint }
+    {
+        landlord: principal,
+        rent-amount: uint,
+        rental-period: uint,
+        deposit-amount: uint,
+        is-available: bool,
+        listing-date: uint,
+    }
+)
+
+(define-map rental-agreements
+    { rental-id: uint }
+    {
+        property-id: uint,
+        landlord: principal,
+        tenant: principal,
+        rent-amount: uint,
+        rental-period: uint,
+        deposit-amount: uint,
+        start-date: uint,
+        end-date: uint,
+        last-payment-date: uint,
+        next-payment-due: uint,
+        is-active: bool,
     }
 )
 
@@ -428,6 +464,18 @@
     (- (var-get appraisal-id-counter) u1)
 )
 
+(define-read-only (get-rental-listing (property-id uint))
+    (map-get? rental-listings { property-id: property-id })
+)
+
+(define-read-only (get-rental-agreement (rental-id uint))
+    (map-get? rental-agreements { rental-id: rental-id })
+)
+
+(define-read-only (get-rental-count)
+    (- (var-get rental-id-counter) u1)
+)
+
 (define-public (set-registry-fee (new-fee uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
@@ -511,5 +559,149 @@
 
         (var-set appraisal-id-counter (+ appraisal-id u1))
         (ok appraisal-id)
+    )
+)
+
+(define-public (list-property-for-rent
+        (property-id uint)
+        (rent-amount uint)
+        (rental-period uint)
+        (deposit-amount uint)
+    )
+    (let ((property (unwrap! (map-get? properties { property-id: property-id })
+            ERR_PROPERTY_NOT_FOUND
+        )))
+        (asserts! (is-eq (get owner property) tx-sender) ERR_NOT_OWNER)
+        (asserts! (> rent-amount u0) ERR_INVALID_PRICE)
+        (asserts! (> rental-period u0) ERR_INVALID_RENTAL_PERIOD)
+        (asserts! (> deposit-amount u0) ERR_INVALID_PRICE)
+
+        (map-set rental-listings { property-id: property-id } {
+            landlord: tx-sender,
+            rent-amount: rent-amount,
+            rental-period: rental-period,
+            deposit-amount: deposit-amount,
+            is-available: true,
+            listing-date: stacks-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (remove-rental-listing (property-id uint))
+    (let ((rental-listing (unwrap! (map-get? rental-listings { property-id: property-id })
+            ERR_PROPERTY_NOT_FOR_RENT
+        )))
+        (asserts! (is-eq (get landlord rental-listing) tx-sender) ERR_NOT_OWNER)
+
+        (map-set rental-listings { property-id: property-id }
+            (merge rental-listing { is-available: false })
+        )
+        (ok true)
+    )
+)
+
+(define-public (rent-property (property-id uint))
+    (let (
+            (rental-listing (unwrap! (map-get? rental-listings { property-id: property-id })
+                ERR_PROPERTY_NOT_FOR_RENT
+            ))
+            (property (unwrap! (map-get? properties { property-id: property-id })
+                ERR_PROPERTY_NOT_FOUND
+            ))
+            (rental-id (var-get rental-id-counter))
+            (current-height stacks-block-height)
+            (end-date (+ current-height (get rental-period rental-listing)))
+            (next-payment-due (+ current-height (get rental-period rental-listing)))
+            (total-upfront (+ (get rent-amount rental-listing)
+                (get deposit-amount rental-listing)
+            ))
+        )
+        (asserts! (get is-available rental-listing) ERR_PROPERTY_NOT_FOR_RENT)
+        (asserts! (not (is-eq tx-sender (get landlord rental-listing)))
+            ERR_CANNOT_BUY_OWN_PROPERTY
+        )
+
+        (try! (stx-transfer? total-upfront tx-sender (get landlord rental-listing)))
+
+        (map-set rental-agreements { rental-id: rental-id } {
+            property-id: property-id,
+            landlord: (get landlord rental-listing),
+            tenant: tx-sender,
+            rent-amount: (get rent-amount rental-listing),
+            rental-period: (get rental-period rental-listing),
+            deposit-amount: (get deposit-amount rental-listing),
+            start-date: current-height,
+            end-date: end-date,
+            last-payment-date: current-height,
+            next-payment-due: next-payment-due,
+            is-active: true,
+        })
+
+        (map-set rental-listings { property-id: property-id }
+            (merge rental-listing { is-available: false })
+        )
+
+        (var-set rental-id-counter (+ rental-id u1))
+        (ok rental-id)
+    )
+)
+
+(define-public (pay-rent (rental-id uint))
+    (let (
+            (rental-agreement (unwrap! (map-get? rental-agreements { rental-id: rental-id })
+                ERR_PROPERTY_NOT_FOUND
+            ))
+            (current-height stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender (get tenant rental-agreement)) ERR_NOT_TENANT)
+        (asserts! (get is-active rental-agreement) ERR_RENTAL_EXPIRED)
+        (asserts! (>= current-height (get next-payment-due rental-agreement))
+            ERR_RENT_NOT_DUE
+        )
+        (asserts! (<= current-height (get end-date rental-agreement))
+            ERR_RENTAL_EXPIRED
+        )
+
+        (try! (stx-transfer? (get rent-amount rental-agreement) tx-sender
+            (get landlord rental-agreement)
+        ))
+
+        (map-set rental-agreements { rental-id: rental-id }
+            (merge rental-agreement {
+                last-payment-date: current-height,
+                next-payment-due: (+ current-height (get rental-period rental-agreement)),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (terminate-rental (rental-id uint))
+    (let ((rental-agreement (unwrap! (map-get? rental-agreements { rental-id: rental-id })
+            ERR_PROPERTY_NOT_FOUND
+        )))
+        (asserts!
+            (or
+                (is-eq tx-sender (get landlord rental-agreement))
+                (is-eq tx-sender (get tenant rental-agreement))
+            )
+            ERR_NOT_AUTHORIZED
+        )
+        (asserts! (get is-active rental-agreement) ERR_RENTAL_EXPIRED)
+
+        (try! (stx-transfer? (get deposit-amount rental-agreement)
+            (get landlord rental-agreement) (get tenant rental-agreement)
+        ))
+
+        (map-set rental-agreements { rental-id: rental-id }
+            (merge rental-agreement { is-active: false })
+        )
+
+        (map-set rental-listings { property-id: (get property-id rental-agreement) }
+            (merge
+                (unwrap-panic (map-get? rental-listings { property-id: (get property-id rental-agreement) })) { is-available: true }
+            ))
+        (ok true)
     )
 )
