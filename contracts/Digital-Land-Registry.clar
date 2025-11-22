@@ -161,7 +161,10 @@
 
 ;; Insurance Policy Storage
 (define-map insurance-policies
-    { property-id: uint, policy-id: uint }
+    {
+        property-id: uint,
+        policy-id: uint,
+    }
     {
         provider: (string-ascii 100),
         policy-holder: principal,
@@ -170,13 +173,16 @@
         start-date: uint,
         end-date: uint,
         status: (string-ascii 20),
-        created-at: uint
+        created-at: uint,
     }
 )
 
 ;; Insurance Claims Tracking
 (define-map insurance-claims
-    { property-id: uint, claim-id: uint }
+    {
+        property-id: uint,
+        claim-id: uint,
+    }
     {
         policy-id: uint,
         claimant: principal,
@@ -185,19 +191,28 @@
         claim-date: uint,
         status: (string-ascii 20),
         processed-date: (optional uint),
-        approved-amount: (optional uint)
+        approved-amount: (optional uint),
     }
 )
 
 ;; Premium Payment History
 (define-map premium-payments
-    { property-id: uint, policy-id: uint, payment-id: uint }
+    {
+        property-id: uint,
+        policy-id: uint,
+        payment-id: uint,
+    }
     {
         payer: principal,
         amount: uint,
         payment-date: uint,
-        period-covered: (string-ascii 50)
+        period-covered: (string-ascii 50),
     }
+)
+
+(define-map active-policy-index
+    { property-id: uint }
+    { policy-id: uint }
 )
 
 ;; Document Registry Storage
@@ -207,19 +222,25 @@
 )
 
 (define-map property-documents
-    { property-id: uint, doc-id: uint }
+    {
+        property-id: uint,
+        doc-id: uint,
+    }
     {
         hash: (buff 32),
         doc-type: (string-ascii 32),
         uri: (string-ascii 256),
         added-by: principal,
         added-at: uint,
-        revoked: bool
+        revoked: bool,
     }
 )
 
 (define-map property-doc-hash-index
-    { property-id: uint, hash: (buff 32) }
+    {
+        property-id: uint,
+        hash: (buff 32),
+    }
     { doc-id: uint }
 )
 
@@ -811,17 +832,35 @@
             (policy-id (var-get policy-id-counter))
             (current-height stacks-block-height)
             (end-date (+ current-height policy-duration))
+            (maybe-active (map-get? active-policy-index { property-id: property-id }))
         )
         (asserts! (is-eq (get owner property) tx-sender) ERR_NOT_OWNER)
         (asserts! (> coverage-amount u0) ERR_INVALID_COVERAGE_AMOUNT)
         (asserts! (> premium-amount u0) ERR_INVALID_PREMIUM)
         (asserts! (> policy-duration u0) ERR_INVALID_RENTAL_PERIOD)
-        
-        ;; Transfer premium payment
+        (if (is-some maybe-active)
+            (let (
+                    (active-id (get policy-id (unwrap-panic maybe-active)))
+                    (maybe-policy (map-get? insurance-policies {
+                        property-id: property-id,
+                        policy-id: active-id,
+                    }))
+                )
+                (if (is-some maybe-policy)
+                    (asserts!
+                        (not (is-eq (get status (unwrap-panic maybe-policy)) "ACTIVE"))
+                        ERR_INSURANCE_ALREADY_EXISTS
+                    )
+                    true
+                )
+            )
+            true
+        )
         (try! (stx-transfer? premium-amount tx-sender CONTRACT_OWNER))
-        
-        ;; Create policy
-        (map-set insurance-policies { property-id: property-id, policy-id: policy-id } {
+        (map-set insurance-policies {
+            property-id: property-id,
+            policy-id: policy-id,
+        } {
             provider: provider,
             policy-holder: tx-sender,
             coverage-amount: coverage-amount,
@@ -829,17 +868,22 @@
             start-date: current-height,
             end-date: end-date,
             status: "ACTIVE",
-            created-at: current-height
+            created-at: current-height,
         })
-        
-        ;; Record initial premium payment
-        (map-set premium-payments { property-id: property-id, policy-id: policy-id, payment-id: u1 } {
-            payer: tx-sender,
-            amount: premium-amount,
-            payment-date: current-height,
-            period-covered: "INITIAL"
-        })
-        
+        (let ((initial-payment-id (var-get payment-id-counter)))
+            (map-set premium-payments {
+                property-id: property-id,
+                policy-id: policy-id,
+                payment-id: initial-payment-id,
+            } {
+                payer: tx-sender,
+                amount: premium-amount,
+                payment-date: current-height,
+                period-covered: "INITIAL",
+            })
+            (var-set payment-id-counter (+ initial-payment-id u1))
+        )
+        (map-set active-policy-index { property-id: property-id } { policy-id: policy-id })
         (var-set policy-id-counter (+ policy-id u1))
         (ok policy-id)
     )
@@ -855,21 +899,32 @@
             (property (unwrap! (map-get? properties { property-id: property-id })
                 ERR_PROPERTY_NOT_FOUND
             ))
-            (policy (unwrap! (map-get? insurance-policies { property-id: property-id, policy-id: policy-id })
+            (policy (unwrap!
+                (map-get? insurance-policies {
+                    property-id: property-id,
+                    policy-id: policy-id,
+                })
                 ERR_INSURANCE_NOT_FOUND
             ))
             (claim-id (var-get claim-id-counter))
             (current-height stacks-block-height)
         )
         (asserts! (is-eq (get owner property) tx-sender) ERR_NOT_OWNER)
-        (asserts! (is-eq (get policy-holder policy) tx-sender) ERR_UNAUTHORIZED_INSURANCE)
+        (asserts! (is-eq (get policy-holder policy) tx-sender)
+            ERR_UNAUTHORIZED_INSURANCE
+        )
         (asserts! (is-eq (get status policy) "ACTIVE") ERR_INSURANCE_EXPIRED)
         (asserts! (<= current-height (get end-date policy)) ERR_INSURANCE_EXPIRED)
         (asserts! (> claim-amount u0) ERR_INVALID_PRICE)
-        (asserts! (<= claim-amount (get coverage-amount policy)) ERR_INVALID_COVERAGE_AMOUNT)
-        
+        (asserts! (<= claim-amount (get coverage-amount policy))
+            ERR_INVALID_COVERAGE_AMOUNT
+        )
+
         ;; Create claim
-        (map-set insurance-claims { property-id: property-id, claim-id: claim-id } {
+        (map-set insurance-claims {
+            property-id: property-id,
+            claim-id: claim-id,
+        } {
             policy-id: policy-id,
             claimant: tx-sender,
             claim-amount: claim-amount,
@@ -877,9 +932,9 @@
             claim-date: current-height,
             status: "PENDING",
             processed-date: none,
-            approved-amount: none
+            approved-amount: none,
         })
-        
+
         (var-set claim-id-counter (+ claim-id u1))
         (ok claim-id)
     )
@@ -892,37 +947,57 @@
         (approved-amount (optional uint))
     )
     (let (
-            (claim (unwrap! (map-get? insurance-claims { property-id: property-id, claim-id: claim-id })
+            (claim (unwrap!
+                (map-get? insurance-claims {
+                    property-id: property-id,
+                    claim-id: claim-id,
+                })
                 ERR_CLAIM_NOT_FOUND
             ))
-            (policy (unwrap! (map-get? insurance-policies { property-id: property-id, policy-id: (get policy-id claim) })
+            (policy (unwrap!
+                (map-get? insurance-policies {
+                    property-id: property-id,
+                    policy-id: (get policy-id claim),
+                })
                 ERR_INSURANCE_NOT_FOUND
             ))
             (current-height stacks-block-height)
         )
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-        (asserts! (is-eq (get status claim) "PENDING") ERR_CLAIM_ALREADY_PROCESSED)
-        
+        (asserts! (is-eq (get status claim) "PENDING")
+            ERR_CLAIM_ALREADY_PROCESSED
+        )
+
         (if approved
             (begin
                 (let ((payout-amount (default-to (get claim-amount claim) approved-amount)))
-                    (asserts! (<= payout-amount (get coverage-amount policy)) ERR_INVALID_COVERAGE_AMOUNT)
-                    (try! (stx-transfer? payout-amount CONTRACT_OWNER (get claimant claim)))
-                    
-                    (map-set insurance-claims { property-id: property-id, claim-id: claim-id }
+                    (asserts! (<= payout-amount (get coverage-amount policy))
+                        ERR_INVALID_COVERAGE_AMOUNT
+                    )
+                    (try! (stx-transfer? payout-amount CONTRACT_OWNER
+                        (get claimant claim)
+                    ))
+
+                    (map-set insurance-claims {
+                        property-id: property-id,
+                        claim-id: claim-id,
+                    }
                         (merge claim {
                             status: "APPROVED",
                             processed-date: (some current-height),
-                            approved-amount: (some payout-amount)
+                            approved-amount: (some payout-amount),
                         })
                     )
                 )
             )
-            (map-set insurance-claims { property-id: property-id, claim-id: claim-id }
+            (map-set insurance-claims {
+                property-id: property-id,
+                claim-id: claim-id,
+            }
                 (merge claim {
                     status: "REJECTED",
                     processed-date: (some current-height),
-                    approved-amount: none
+                    approved-amount: none,
                 })
             )
         )
@@ -938,48 +1013,178 @@
             (property (unwrap! (map-get? properties { property-id: property-id })
                 ERR_PROPERTY_NOT_FOUND
             ))
-            (policy (unwrap! (map-get? insurance-policies { property-id: property-id, policy-id: policy-id })
+            (policy (unwrap!
+                (map-get? insurance-policies {
+                    property-id: property-id,
+                    policy-id: policy-id,
+                })
                 ERR_INSURANCE_NOT_FOUND
             ))
         )
         (asserts! (is-eq (get owner property) tx-sender) ERR_NOT_OWNER)
-        (asserts! (is-eq (get policy-holder policy) tx-sender) ERR_UNAUTHORIZED_INSURANCE)
+        (asserts! (is-eq (get policy-holder policy) tx-sender)
+            ERR_UNAUTHORIZED_INSURANCE
+        )
         (asserts! (is-eq (get status policy) "ACTIVE") ERR_INSURANCE_EXPIRED)
-        
-        ;; Update policy status
-        (map-set insurance-policies { property-id: property-id, policy-id: policy-id }
+        (map-set insurance-policies {
+            property-id: property-id,
+            policy-id: policy-id,
+        }
             (merge policy { status: "CANCELLED" })
         )
         (ok true)
     )
 )
 
+(define-public (renew-insurance-policy
+        (property-id uint)
+        (policy-id uint)
+        (new-coverage-amount uint)
+        (new-premium-amount uint)
+        (policy-duration uint)
+    )
+    (let (
+            (policy (unwrap!
+                (map-get? insurance-policies {
+                    property-id: property-id,
+                    policy-id: policy-id,
+                })
+                ERR_INSURANCE_NOT_FOUND
+            ))
+            (current-height stacks-block-height)
+            (new-end-date (+ current-height policy-duration))
+        )
+        (asserts! (is-eq (get policy-holder policy) tx-sender)
+            ERR_UNAUTHORIZED_INSURANCE
+        )
+        (asserts! (is-eq (get status policy) "ACTIVE") ERR_INSURANCE_EXPIRED)
+        (asserts! (> new-coverage-amount u0) ERR_INVALID_COVERAGE_AMOUNT)
+        (asserts! (> new-premium-amount u0) ERR_INVALID_PREMIUM)
+        (asserts! (> policy-duration u0) ERR_INVALID_RENTAL_PERIOD)
+        (try! (stx-transfer? new-premium-amount tx-sender CONTRACT_OWNER))
+        (map-set insurance-policies {
+            property-id: property-id,
+            policy-id: policy-id,
+        }
+            (merge policy {
+                coverage-amount: new-coverage-amount,
+                premium-amount: new-premium-amount,
+                start-date: current-height,
+                end-date: new-end-date,
+                status: "ACTIVE",
+            })
+        )
+        (let ((payment-id (var-get payment-id-counter)))
+            (map-set premium-payments {
+                property-id: property-id,
+                policy-id: policy-id,
+                payment-id: payment-id,
+            } {
+                payer: tx-sender,
+                amount: new-premium-amount,
+                payment-date: current-height,
+                period-covered: "RENEWAL",
+            })
+            (var-set payment-id-counter (+ payment-id u1))
+        )
+        (ok true)
+    )
+)
+
+(define-public (record-premium-payment
+        (property-id uint)
+        (policy-id uint)
+        (period-covered (string-ascii 50))
+    )
+    (let (
+            (policy (unwrap!
+                (map-get? insurance-policies {
+                    property-id: property-id,
+                    policy-id: policy-id,
+                })
+                ERR_INSURANCE_NOT_FOUND
+            ))
+            (payment-id (var-get payment-id-counter))
+            (current-height stacks-block-height)
+        )
+        (asserts! (is-eq (get policy-holder policy) tx-sender)
+            ERR_UNAUTHORIZED_INSURANCE
+        )
+        (asserts! (is-eq (get status policy) "ACTIVE") ERR_INSURANCE_EXPIRED)
+        (try! (stx-transfer? (get premium-amount policy) tx-sender CONTRACT_OWNER))
+        (map-set premium-payments {
+            property-id: property-id,
+            policy-id: policy-id,
+            payment-id: payment-id,
+        } {
+            payer: tx-sender,
+            amount: (get premium-amount policy),
+            payment-date: current-height,
+            period-covered: period-covered,
+        })
+        (var-set payment-id-counter (+ payment-id u1))
+        (ok payment-id)
+    )
+)
+
 ;; ===== INSURANCE READ-ONLY FUNCTIONS =====
 
-(define-read-only (get-insurance-policy (property-id uint) (policy-id uint))
-    (map-get? insurance-policies { property-id: property-id, policy-id: policy-id })
+(define-read-only (get-insurance-policy
+        (property-id uint)
+        (policy-id uint)
+    )
+    (map-get? insurance-policies {
+        property-id: property-id,
+        policy-id: policy-id,
+    })
 )
 
-(define-read-only (get-insurance-claim (property-id uint) (claim-id uint))
-    (map-get? insurance-claims { property-id: property-id, claim-id: claim-id })
+(define-read-only (get-insurance-claim
+        (property-id uint)
+        (claim-id uint)
+    )
+    (map-get? insurance-claims {
+        property-id: property-id,
+        claim-id: claim-id,
+    })
 )
 
-(define-read-only (get-premium-payment (property-id uint) (policy-id uint) (payment-id uint))
-    (map-get? premium-payments { property-id: property-id, policy-id: policy-id, payment-id: payment-id })
+(define-read-only (get-premium-payment
+        (property-id uint)
+        (policy-id uint)
+        (payment-id uint)
+    )
+    (map-get? premium-payments {
+        property-id: property-id,
+        policy-id: policy-id,
+        payment-id: payment-id,
+    })
 )
 
-(define-read-only (is-policy-active (property-id uint) (policy-id uint))
-    (match (map-get? insurance-policies { property-id: property-id, policy-id: policy-id })
-        policy (and 
-                (is-eq (get status policy) "ACTIVE")
-                (<= stacks-block-height (get end-date policy))
-               )
+(define-read-only (is-policy-active
+        (property-id uint)
+        (policy-id uint)
+    )
+    (match (map-get? insurance-policies {
+        property-id: property-id,
+        policy-id: policy-id,
+    })
+        policy (and
+            (is-eq (get status policy) "ACTIVE")
+            (<= stacks-block-height (get end-date policy))
+        )
         false
     )
 )
 
-(define-read-only (get-policy-coverage (property-id uint) (policy-id uint))
-    (match (map-get? insurance-policies { property-id: property-id, policy-id: policy-id })
+(define-read-only (get-policy-coverage
+        (property-id uint)
+        (policy-id uint)
+    )
+    (match (map-get? insurance-policies {
+        property-id: property-id,
+        policy-id: policy-id,
+    })
         policy (some (get coverage-amount policy))
         none
     )
@@ -1012,36 +1217,44 @@
             (doc-id (var-get doc-id-counter))
             (current-height stacks-block-height)
         )
-        (asserts! (is-eq (get owner property) tx-sender) ERR_DOC_NOT_PROPERTY_OWNER)
+        (asserts! (is-eq (get owner property) tx-sender)
+            ERR_DOC_NOT_PROPERTY_OWNER
+        )
         (asserts!
-            (is-none (map-get? property-doc-hash-index { property-id: property-id, hash: doc-hash }))
+            (is-none (map-get? property-doc-hash-index {
+                property-id: property-id,
+                hash: doc-hash,
+            }))
             ERR_DOC_EXISTS
         )
-        
+
         ;; Create document record
-        (map-set property-documents { property-id: property-id, doc-id: doc-id } {
+        (map-set property-documents {
+            property-id: property-id,
+            doc-id: doc-id,
+        } {
             hash: doc-hash,
             doc-type: doc-type,
             uri: uri,
             added-by: tx-sender,
             added-at: current-height,
-            revoked: false
+            revoked: false,
         })
-        
+
         ;; Add to hash index
-        (map-set property-doc-hash-index { property-id: property-id, hash: doc-hash } {
-            doc-id: doc-id
-        })
-        
+        (map-set property-doc-hash-index {
+            property-id: property-id,
+            hash: doc-hash,
+        } { doc-id: doc-id }
+        )
+
         ;; Update document count
         (let ((current-count (default-to { count: u0 }
                 (map-get? property-doc-counts { property-id: property-id })
             )))
-            (map-set property-doc-counts { property-id: property-id } {
-                count: (+ (get count current-count) u1)
-            })
+            (map-set property-doc-counts { property-id: property-id } { count: (+ (get count current-count) u1) })
         )
-        
+
         (var-set doc-id-counter (+ doc-id u1))
         (ok doc-id)
     )
@@ -1055,26 +1268,41 @@
             (property (unwrap! (map-get? properties { property-id: property-id })
                 ERR_DOC_PROPERTY_NOT_FOUND
             ))
-            (document (unwrap! (map-get? property-documents { property-id: property-id, doc-id: doc-id })
+            (document (unwrap!
+                (map-get? property-documents {
+                    property-id: property-id,
+                    doc-id: doc-id,
+                })
                 ERR_DOC_NOT_FOUND
             ))
         )
-        (asserts! (is-eq (get owner property) tx-sender) ERR_DOC_NOT_PROPERTY_OWNER)
+        (asserts! (is-eq (get owner property) tx-sender)
+            ERR_DOC_NOT_PROPERTY_OWNER
+        )
         (asserts! (not (get revoked document)) ERR_ALREADY_REVOKED)
-        
+
         ;; Update document to revoked status
-        (map-set property-documents { property-id: property-id, doc-id: doc-id }
+        (map-set property-documents {
+            property-id: property-id,
+            doc-id: doc-id,
+        }
             (merge document { revoked: true })
         )
-        
+
         (ok true)
     )
 )
 
 ;; ===== DOCUMENT REGISTRY READ-ONLY FUNCTIONS =====
 
-(define-read-only (get-document (property-id uint) (doc-id uint))
-    (map-get? property-documents { property-id: property-id, doc-id: doc-id })
+(define-read-only (get-document
+        (property-id uint)
+        (doc-id uint)
+    )
+    (map-get? property-documents {
+        property-id: property-id,
+        doc-id: doc-id,
+    })
 )
 
 (define-read-only (get-doc-count (property-id uint))
@@ -1084,10 +1312,22 @@
     )
 )
 
-(define-read-only (has-document (property-id uint) (doc-hash (buff 32)))
-    (is-some (map-get? property-doc-hash-index { property-id: property-id, hash: doc-hash }))
+(define-read-only (has-document
+        (property-id uint)
+        (doc-hash (buff 32))
+    )
+    (is-some (map-get? property-doc-hash-index {
+        property-id: property-id,
+        hash: doc-hash,
+    }))
 )
 
-(define-read-only (get-doc-id-by-hash (property-id uint) (doc-hash (buff 32)))
-    (map-get? property-doc-hash-index { property-id: property-id, hash: doc-hash })
+(define-read-only (get-doc-id-by-hash
+        (property-id uint)
+        (doc-hash (buff 32))
+    )
+    (map-get? property-doc-hash-index {
+        property-id: property-id,
+        hash: doc-hash,
+    })
 )

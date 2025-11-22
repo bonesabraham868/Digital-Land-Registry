@@ -62,6 +62,6 @@ plan:
         - emulated-contract-publish:
             contract-name: Digital-Land-Registry
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: "contracts\\Digital-Land-Registry.clar"
+            path: contracts/Digital-Land-Registry.clar
             clarity-version: 3
       epoch: "3.1"
